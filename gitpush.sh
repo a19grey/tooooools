@@ -17,12 +17,120 @@ PERSONAL_NAME="a19grey"
 PERSONAL_EMAIL="a19grey@gmail.com"
 WORK_NAME="AlexKTracerMain"
 WORK_EMAIL="alex@traceup.com"
+SKIP_N8N_EXPORT=0
 
 # Function to display usage information
 usage() {
-    printf "\nUsage: %s \"commit message\"\n" "$0" >&2
+    printf "\nUsage: %s [--skip-n8n-export] \"commit message\"\n" "$0" >&2
+    printf "  --skip-n8n-export: Skip Docker-based n8n workflow export before git actions\n" >&2
     printf "  commit message: The message for your git commit\n" >&2
     exit 1
+}
+
+# Export n8n workflows if this repo has a docker-compose n8n service.
+get_n8n_data_container_path() {
+    local compose_file=$1
+
+    # Parse short-form volume mappings under services.n8n.volumes and return
+    # the first container-side mount path (for example: /home/node/.n8n).
+    awk '
+        BEGIN {
+            in_n8n = 0
+            in_volumes = 0
+        }
+
+        /^[[:space:]]{2}n8n:[[:space:]]*$/ {
+            in_n8n = 1
+            in_volumes = 0
+            next
+        }
+
+        in_n8n && /^[[:space:]]{2}[A-Za-z0-9_.-]+:[[:space:]]*$/ && $0 !~ /^[[:space:]]{2}n8n:[[:space:]]*$/ {
+            exit
+        }
+
+        in_n8n && /^[[:space:]]{4}volumes:[[:space:]]*$/ {
+            in_volumes = 1
+            next
+        }
+
+        in_n8n && in_volumes && /^[[:space:]]{4}[A-Za-z0-9_.-]+:[[:space:]]*$/ && $0 !~ /^[[:space:]]{4}volumes:[[:space:]]*$/ {
+            in_volumes = 0
+        }
+
+        in_n8n && in_volumes && /^[[:space:]]{6}-[[:space:]]*/ {
+            line = $0
+            sub(/^[[:space:]]{6}-[[:space:]]*/, "", line)
+            count = split(line, parts, ":")
+
+            if (count >= 2) {
+                container_path = parts[2]
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", container_path)
+                gsub(/["'\'']/, "", container_path)
+
+                if (container_path ~ /^\//) {
+                    print container_path
+                    exit
+                }
+            }
+        }
+    ' "$compose_file"
+}
+
+export_n8n_workflows_if_configured() {
+    local repo_root=$1
+    local compose_file="$repo_root/docker-compose.yml"
+    local has_n8n_service=0
+    local n8n_export_host_path="$repo_root"
+    local n8n_data_container_path
+    local n8n_export_container_path
+
+    if [ ! -f "$compose_file" ]; then
+        printf "\n=== No docker-compose.yml found. Skipping n8n export. ===\n" >&2
+        return 0
+    fi
+
+    if rg -q '^[[:space:]]{2}n8n:[[:space:]]*$' "$compose_file"; then
+        has_n8n_service=1
+    fi
+
+    if [ "$has_n8n_service" -ne 1 ]; then
+        printf "\n=== docker-compose.yml found, but no n8n service. Skipping n8n export. ===\n" >&2
+        return 0
+    fi
+
+    if ! command -v docker >/dev/null 2>&1; then
+        printf "\n!!! ERROR: docker is required for n8n export but is not installed !!!\n" >&2
+        exit 1
+    fi
+
+    n8n_data_container_path=$(get_n8n_data_container_path "$compose_file")
+    if [ -z "$n8n_data_container_path" ]; then
+        printf "\n!!! ERROR: Could not detect n8n container data path from %s !!!\n" "$compose_file" >&2
+        printf "Expected a volumes mapping in the n8n service (example: n8n_data:/home/node/.n8n).\n" >&2
+        exit 1
+    fi
+
+    n8n_export_container_path="${n8n_data_container_path%/}/exported_workflows/"
+
+    printf "\n=== Exporting n8n workflows to %s ===\n" "$n8n_export_host_path" >&2
+    printf "=== Using n8n container data path: %s ===\n" "$n8n_data_container_path" >&2
+
+    mkdir -p "$n8n_export_host_path"
+
+    if ! docker compose -f "$compose_file" exec -u node n8n sh -lc \
+        "rm -rf \"$n8n_export_container_path\" && mkdir -p \"$n8n_export_container_path\" && n8n export:workflow --all --backup --output=\"$n8n_export_container_path\""; then
+        printf "\n!!! ERROR: n8n export command failed !!!\n" >&2
+        exit 1
+    fi
+
+    if ! docker compose -f "$compose_file" cp \
+        "n8n:${n8n_export_container_path}." "$n8n_export_host_path"; then
+        printf "\n!!! ERROR: Failed copying exported n8n workflows to host path !!!\n" >&2
+        exit 1
+    fi
+
+    printf "=== n8n workflow export completed successfully ===\n" >&2
 }
 
 # Function to commit and push changes
@@ -39,6 +147,13 @@ commit_and_push() {
     # Change to the repository root directory
     printf "\n=== Changing to repository root: %s ===\n" "$repo_root" >&2
     cd "$repo_root"
+
+    # Ensure latest n8n workflows are exported before staging git changes unless skipped.
+    if [ "$SKIP_N8N_EXPORT" -eq 1 ]; then
+        printf "\n=== Skipping n8n workflow export (--skip-n8n-export) ===\n" >&2
+    else
+        export_n8n_workflows_if_configured "$repo_root"
+    fi
 
     # Show what will be staged
     printf "\n=== Files to be staged: ===\n" >&2
@@ -90,6 +205,26 @@ commit_and_push() {
 
 # Main script execution starts here
 
+# Parse optional flags
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --skip-n8n-export)
+            SKIP_N8N_EXPORT=1
+            shift
+            ;;
+        --help|-h)
+            usage
+            ;;
+        --*)
+            printf "\n!!! ERROR: Unknown option: %s !!!\n" "$1" >&2
+            usage
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
 # Validate command line arguments
 if [ $# -lt 1 ]; then
     usage
@@ -118,12 +253,12 @@ fi
 
 # Determine the account based on the SSH host or organization in the remote URL
 case "$remote_url" in
-    *github.com-personal*)
+    *github.com-personal*|*":${PERSONAL_NAME}/"*|*"github.com/${PERSONAL_NAME}/"*)
         git config user.name "$PERSONAL_NAME"
         git config user.email "$PERSONAL_EMAIL"
         printf "\n=== Using personal account: %s <%s> ===\n" "$PERSONAL_NAME" "$PERSONAL_EMAIL" >&2
         ;;
-    *github.com-trace*|*tracevision*)
+    *github.com-trace*|*tracevision*|*":${WORK_NAME}/"*|*"github.com/${WORK_NAME}/"*)
         git config user.name "$WORK_NAME"
         git config user.email "$WORK_EMAIL"
         printf "\n=== Using work account: %s <%s> ===\n" "$WORK_NAME" "$WORK_EMAIL" >&2
